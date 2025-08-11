@@ -159,7 +159,7 @@ with tab1:
     cashflows = np.full_like(t, c); cashflows[-1] += face
     dfs = 1.0 / (1.0 + ytm / freq) ** (t * freq)
     pv = cashflows * dfs
-    df = pd.DataFrame({"Time (yrs)": t, "Cash Flow": cashflows, "DF1 (YTM)":, dfs.name if hasattr(dfs, "name") else "Discount Factor": dfs, "PV": pv})
+    df = pd.DataFrame({"Time (yrs)": t, "Cash Flow": cashflows, "DF1 (YTM)": dfs, dfs.name if hasattr(dfs, "name") else "Discount Factor": dfs, "PV": pv})
     st.dataframe(df, use_container_width=True)
 
 with tab2:
