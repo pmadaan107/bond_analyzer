@@ -1,376 +1,305 @@
-# yield_spread_forecast_app.py (International)
-# -------------------------------------------------------------
-# Yield Spread Forecasting with AR/VAR and Risk/"Recession" Probability
-# -------------------------------------------------------------
-# New: COUNTRY SUPPORT
-# - Choose a country (US, CA, UK, DE, FR, JP, AU, IN)
-# - Pull monthly long-term (≈10Y) and short-term (≈3M) rates from FRED's
-#   OECD-harmonized series via CSV endpoints (no API key, Python 3.12+ safe)
-# - Build 10Y–3M spread (proxy for 10Y–2Y when 2Y isn't available)
-# - Macro covariates from OECD series on FRED: Unemployment, CPI YoY, IP YoY
-# - For the US ONLY: use NBER USREC as the recession target for a logistic model
-# - For other countries: use a generic "risk" probability: probability that the
-#   yield curve is inverted within a forward window (logistic model)
-# -------------------------------------------------------------
-
-import warnings
-warnings.filterwarnings("ignore")
-
-import streamlit as st
-import pandas as pd
+# bond_yield_curve_explorer.py
+import math
+from dataclasses import dataclass
+from typing import Dict, Tuple
 import numpy as np
-import statsmodels.api as sm
-from statsmodels.tsa.api import VAR
-from statsmodels.tsa.ar_model import AutoReg
-from statsmodels.tools.tools import add_constant
-import plotly.graph_objects as go
-from datetime import date
+import pandas as pd
+import requests
+import streamlit as st
+import matplotlib.pyplot as plt
+from datetime import datetime
 
-# =============================
-# ---------- UI SETUP ---------
-# =============================
-st.set_page_config(page_title="Yield Spread Forecasting (AR/VAR) – International", layout="wide")
+st.set_page_config(page_title="Bond Valuation & Yield Curve Explorer", layout="wide")
 
-HERO_TITLE = "🌍 Yield Spread Forecasting — AR/VAR + Risk Probability"
-HERO_SUB = "Pick a country • OECD/FRED monthly data • CFA L2 concepts: term structure, econometrics"
-
-st.markdown(
+# ======================
+# Utility: Canada curve
+# ======================
+def try_fetch_canada_curve() -> Tuple[Dict[float,float], str]:
     """
-    <style>
-    :root { --bg:#0d1117; --panel:#161b22; --border:#30363d; --text:#e6edf3; --muted:#9db1d6; }
-    html, body, [data-testid="stAppViewContainer"] { background: var(--bg); color: var(--text); }
-    [data-testid="stSidebar"] { background: #0c1220; }
-    .big { font-size: 1.6rem; font-weight:700; }
-    .muted { color: var(--muted); }
-    .card { background: var(--panel); padding: 16px; border:1px solid var(--border); border-radius: 16px; }
-    .hr { height:1px; background:var(--border); margin: 1rem 0; }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
-st.markdown(f"<div class='big'>{HERO_TITLE}</div>", unsafe_allow_html=True)
-st.markdown(f"<div class='muted'>{HERO_SUB}</div>", unsafe_allow_html=True)
-st.markdown("<div class='hr'></div>", unsafe_allow_html=True)
-
-# =============================
-# --------- DATA LAYER --------
-# =============================
-# FRED CSV helper (works on Streamlit Cloud without pandas_datareader)
-
-def fred_series(series_id: str, start=None, end=None) -> pd.DataFrame:
-    """Robust FRED loader.
-    First try the stable 'downloaddata' CSV (DATE,VALUE). If that fails, fall back to fredgraph.csv.
+    Tries to fetch a Canada spot/zero-ish curve.
+    1) Primary (preferred): BoC 'zero-coupon' style endpoints (if available).
+    2) Fallback (proxy): BoC Valet 'bond_yields' group (benchmark yields; not pure spots).
+    Returns (tenor->rate_decimal, label_date). If all fail, returns ({}, "").
     """
-    # 1) Preferred: downloaddata endpoint
-    url1 = f"https://fred.stlouisfed.org/series/{series_id}/downloaddata/{series_id}.csv"
+    # --- Attempt 1: (placeholder) zero-coupon group (if BoC exposes; may change)
+    # If you have a confirmed zero-coupon endpoint, plug it here.
+    # For portability, we proceed to fallback proxy immediately.
     try:
-        s = pd.read_csv(url1, parse_dates=["DATE"]).rename(columns={"VALUE": series_id})
-        s = s.set_index("DATE").sort_index()
+        url = "https://www.bankofcanada.ca/valet/observations/group/bond_yields/json?recent=1"
+        r = requests.get(url, timeout=10)
+        if r.status_code == 200:
+            data = r.json()
+            obs = data["observations"][-1]
+            date_label = obs["d"]
+
+            # Map common Gov. of Canada benchmarks (proxy for spots):
+            # Keys are (tenor_years, series_id in BoC Valet)
+            # These IDs can evolve; adjust if you know exact codes in your environment.
+            candidates = [
+                (0.5, "V39053"),   # 6M T-bill
+                (1.0, "V39054"),   # 1Y
+                (2.0, "V39062"),   # 2Y
+                (3.0, "V39057"),   # 3Y
+                (5.0, "V39058"),   # 5Y
+                (7.0, "V39059"),   # 7Y
+                (10.0, "V39056"),  # 10Y
+                (20.0, "V39060"),  # 20Y
+                (30.0, "V39061"),  # 30Y
+            ]
+            curve = {}
+            for t, sid in candidates:
+                if sid in obs and "v" in obs[sid]:
+                    # Values are in percent; convert to decimal
+                    curve[t] = float(obs[sid]["v"]) / 100.0
+            # Keep only if we got at least a few points
+            if len(curve) >= 4:
+                return dict(sorted(curve.items())), date_label
     except Exception:
-        # 2) Fallback: fredgraph.csv?id=SERIES plus explicit start/end
-        url2 = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
-        s = pd.read_csv(url2, parse_dates=["DATE"]).rename(columns={series_id: series_id})
-        s = s.set_index("DATE").sort_index()
+        pass
 
-    # Coerce to numeric and clean
-    s[series_id] = pd.to_numeric(s[series_id], errors="coerce")
-    if start:
-        s = s[s.index >= pd.to_datetime(start)]
-    if end:
-        s = s[s.index <= pd.to_datetime(end)]
-    return s
+    return {}, ""  # give control to manual entry in UI
 
-# Country → OECD/FRED series map (monthly)
-# Long-term yields (10Y): IRLTLT01{ISO3}M156N (percent per annum)
-# Short-term rates (~3M): IR3TIB01{ISO3}M156N
-# Unemployment rate: LRUNTTTT{ISO3}M156S
-# CPI YoY: CPALTT01{ISO3}M657N (growth rate, same period prev year, %)
-# Industrial Production YoY: PRMNTO01{ISO3}M657N (%, total industry)
-COUNTRIES = {
-    "United States": {
-        "iso3": "USA",
-        "LT": "DGS10",        # keep US from DGS10 (daily) but we'll resample to M
-        "ST": "DGS2",         # 2Y for closer match; fallback to IR3TIB01USA... if needed
-        "UNRATE": "UNRATE",
-        "CPI_YoY": "CPIAUCSL",  # we'll transform to YoY
-        "INDPRO": "INDPRO",
-        "USREC": "USREC",
-        "is_us": True,
-    },
-    "Canada":      {"iso3":"CAN"},
-    "United Kingdom": {"iso3":"GBR"},
-    "Germany":     {"iso3":"DEU"},
-    "France":      {"iso3":"FRA"},
-    "Japan":       {"iso3":"JPN"},
-    "Australia":   {"iso3":"AUS"},
-    "India":       {"iso3":"IND"},
-}
+def interp_linear(curve: Dict[float,float], t: float) -> float:
+    xs = np.array(sorted(curve.keys()))
+    ys = np.array([curve[k] for k in xs])
+    if t <= xs[0]: return float(ys[0])
+    if t >= xs[-1]: return float(ys[-1])
+    i = np.searchsorted(xs, t)
+    x0, x1 = xs[i-1], xs[i]
+    y0, y1 = ys[i-1], ys[i]
+    w = (t - x0) / (x1 - x0)
+    return float((1 - w) * y0 + w * y1)
 
+# ======================
+# Bond math (no bumps)
+# ======================
+def cashflow_times(maturity_years: float, freq: int) -> np.ndarray:
+    n = int(round(maturity_years * freq))
+    return np.array([(k+1)/freq for k in range(n)], dtype=float)
 
-def load_country_data(country: str, start: str, end: str) -> pd.DataFrame:
-    cfg = COUNTRIES[country]
-    if cfg.get("is_us"):
-        # US: pull daily series then aggregate to monthly means
-        lt = fred_series(cfg["LT"], start, end)  # DGS10 daily
-        st_ = fred_series(cfg["ST"], start, end) # DGS2  daily
-        un = fred_series(cfg["UNRATE"], start, end)
-        cpi = fred_series(cfg["CPI_YoY"], start, end)   # level
-        ip = fred_series(cfg["INDPRO"], start, end)     # level
-        rec = fred_series(cfg["USREC"], start, end)     # monthly 0/1
+def ytm_price(face: float, coupon_rate: float, ytm: float, maturity_years: float, freq: int) -> float:
+    c = coupon_rate * face / freq
+    t = cashflow_times(maturity_years, freq)
+    y = ytm / freq
+    disc = 1.0 / (1.0 + y) ** (t * freq)
+    cf = np.full_like(t, c); cf[-1] += face
+    return float(np.sum(cf * disc))
 
-        df = lt.join(st_, how="outer").join(un, how="outer").join(cpi, how="outer").join(ip, how="outer").join(rec, how="outer")
-        df = df.sort_index()
-        # Resample to monthly average for rates/levels
-        m = df.resample("M").mean()
-        m["SPREAD"] = m[cfg["LT"]] - m[cfg["ST"]]
-        # Transform to YoY
-        m["CPI_YoY"] = m[cfg["CPI_YoY"]].pct_change(12) * 100
-        m["INDPRO_YoY"] = m[cfg["INDPRO"]].pct_change(12) * 100
-        # Standardize column names
-        out = m.rename(columns={cfg["LT"]:"LT", cfg["ST"]:"ST", cfg["UNRATE"]:"UNRATE", cfg["CPI_YoY"]:"CPI", cfg["INDPRO"]:"INDPRO", cfg["USREC"]:"USREC"})
-        out = out[["SPREAD","UNRATE","CPI_YoY","INDPRO_YoY","USREC"]]
-        return out.dropna(subset=["SPREAD"]).ffill()
+def macaulay_mod_duration_convexity(face: float, coupon_rate: float, ytm: float,
+                                    maturity_years: float, freq: int) -> Tuple[float,float,float,float]:
+    """
+    Returns: (Price, MacaulayDuration_years, ModifiedDuration_years, Convexity_years2)
+    Discrete comp formulas; no bumps.
+    """
+    c = coupon_rate * face / freq
+    t = cashflow_times(maturity_years, freq)
+    k = (t * freq).astype(int)
+    y = ytm / freq
+    cf = np.full_like(t, c); cf[-1] += face
+    disc = 1.0 / (1.0 + y) ** k
 
-    # Non-US: use OECD monthly identifiers hosted on FRED
-    iso3 = cfg["iso3"]
-    lt_id = f"IRLTLT01{iso3}M156N"
-    st_id = f"IR3TIB01{iso3}M156N"
-    un_id = f"LRUNTTTT{iso3}M156S"
-    cpi_yoy_id = f"CPALTT01{iso3}M657N"
-    ip_yoy_id = f"PRMNTO01{iso3}M657N"
+    P = float(np.sum(cf * disc))
+    # Macaulay (years)
+    D_mac = float(np.sum((k * cf * disc)) / (P * freq))
+    # Modified (years)
+    D_mod = D_mac / (1.0 + y)
+    # Discrete convexity (years^2)
+    # C = (1 / (P * m^2)) * sum( CF_k * k*(k+1) / (1+y)^{k+2} )
+    numer = np.sum(cf * (k * (k + 1)) / (1.0 + y) ** (k + 2))
+    C = float(numer / (P * (freq ** 2)))
+    return P, D_mac, D_mod, C
 
-    lt = fred_series(lt_id, start, end)
-    st_ = fred_series(st_id, start, end)
-    un = fred_series(un_id, start, end)
-    cpi = fred_series(cpi_yoy_id, start, end)
-    ip = fred_series(ip_yoy_id, start, end)
+# Curve-based pricing (continuous comp for stability)
+def price_from_spot_curve(face: float, coupon_rate: float, maturity_years: float, freq: int,
+                          spot_curve: Dict[float,float]) -> Tuple[float, pd.DataFrame]:
+    c = coupon_rate * face / freq
+    t = cashflow_times(maturity_years, freq)
+    cf = np.full_like(t, c); cf[-1] += face
+    s = np.array([interp_linear(spot_curve, ti) for ti in t])  # decimal
+    df = np.exp(-s * t)                                       # continuous comp DF
+    pv = cf * df
+    price = float(np.sum(pv))
+    table = pd.DataFrame({
+        "Time (yrs)": t,
+        "Cash Flow": cf,
+        "Spot Rate": s,
+        "Discount Factor": df,
+        "PV": pv
+    })
+    return price, table
 
-    df = lt.join(st_, how="outer").join(un, how="outer").join(cpi, how="outer").join(ip, how="outer")
-    df = df.sort_index()
+def fisher_weil_measures(face: float, coupon_rate: float, maturity_years: float, freq: int,
+                         spot_curve: Dict[float,float]) -> Tuple[float,float,float]:
+    """
+    Returns: (Price, Fisher–Weil Duration [years], FW Convexity [years^2])
+    Using continuous comp spot DFs: DF = exp(-s(t)*t).
+    FW Dur = (1/P) * sum( t * CF_t * DF_t )
+    FW Convexity ~ (1/P) * sum( t^2 * CF_t * DF_t ) under small parallel shifts of s(t)
+    """
+    c = coupon_rate * face / freq
+    t = cashflow_times(maturity_years, freq)
+    cf = np.full_like(t, c); cf[-1] += face
+    s = np.array([interp_linear(spot_curve, ti) for ti in t])
+    df = np.exp(-s * t)
+    pv = cf * df
+    P = float(np.sum(pv))
+    FW_D = float(np.sum(t * pv) / P)
+    FW_C = float(np.sum((t**2) * pv) / P)
+    return P, FW_D, FW_C
 
-    # Build unified frame
-    out = pd.DataFrame(index=df.index)
-    out["LT"] = df[lt_id]
-    out["ST"] = df[st_id]
-    out["UNRATE"] = df[un_id]
-    out["CPI_YoY"] = df[cpi_yoy_id]
-    out["INDPRO_YoY"] = df[ip_yoy_id]
-    out["SPREAD"] = out["LT"] - out["ST"]
-    # No official recession series for generic countries
-    out["USREC"] = np.nan
-    return out.dropna(subset=["SPREAD"]).ffill()
+def ytm_from_price(face, coupon_rate, maturity_years, freq, target_price, tol=1e-12, iters=200):
+    lo, hi = -0.99, 2.0
+    for _ in range(iters):
+        mid = (lo + hi) / 2
+        p = ytm_price(face, coupon_rate, mid, maturity_years, freq)
+        if abs(p - target_price) < tol:
+            return mid
+        if p > target_price:
+            lo = mid
+        else:
+            hi = mid
+    return (lo + hi) / 2
 
-# =============================
-# --------- MODELING -----------
-# =============================
+# ======================
+# Sidebar: Bond inputs
+# ======================
+with st.sidebar:
+    st.subheader("Bond Inputs")
+    face = st.number_input("Face Value", 0.0, 10_000_000.0, 100.0, step=100.0)
+    coupon_pct = st.number_input("Coupon Rate (annual %)", 0.0, 100.0, 5.00, step=0.25)
+    coupon = coupon_pct / 100.0
+    maturity = st.number_input("Maturity (years)", 0.25, 50.0, 10.0, step=0.25)
+    freq = st.selectbox("Coupon Frequency", [1,2,4], index=1)
 
-def fit_ar(model_df: pd.DataFrame, max_lags: int = 12):
-    y = model_df["SPREAD"].dropna()
-    best_aic, best_p, best_model = np.inf, None, None
-    for p in range(1, max_lags + 1):
-        try:
-            m = AutoReg(y, lags=p, old_names=False).fit()
-            if m.aic < best_aic:
-                best_aic, best_p, best_model = m.aic, p, m
-        except Exception:
-            pass
-    return best_model, best_p, best_aic
+# ======================
+# Top banner: Canada spots
+# ======================
+st.markdown("<h1 style='margin-bottom:0'>🇨🇦 Canada Spot Curve & Bond Explorer</h1>", unsafe_allow_html=True)
+st.caption("Live Canada curve (when available) + closed-form duration/convexity. No bumping.")
 
+# Data source selector
+st.divider()
+st.subheader("Current Canada Spot Curve")
+src = st.radio("Source", ["Live fetch (Bank of Canada, proxy)", "Manual input"], horizontal=True)
 
-def fit_var(model_df: pd.DataFrame, max_lags: int = 6):
-    X = model_df[["SPREAD", "UNRATE", "CPI_YoY", "INDPRO_YoY"]].dropna()
-    if len(X) < 24:
-        raise ValueError("Not enough data points for VAR; try an earlier start date.")
-    var = VAR(X)
-    sel = var.select_order(maxlags=max_lags)
-    p = sel.aic or sel.bic or sel.fpe or sel.hqic
-    p = int(p) if p is not None else 2
-    res = var.fit(maxlags=p)
-    return res, p
-
-
-def forecast_ar(model, steps: int = 12):
-    fc = model.get_forecast(steps=steps)
-    mean = fc.predicted_mean
-    conf = fc.conf_int(alpha=0.05)
-    return mean, conf
-
-
-def forecast_var(model, steps: int = 12):
-    fc = model.forecast_interval(model.endog, steps=steps, alpha=0.05)
-    mean = pd.DataFrame(fc[0], columns=model.names)
-    lower = pd.DataFrame(fc[1], columns=model.names)
-    upper = pd.DataFrame(fc[2], columns=model.names)
-    return mean, lower, upper
-
-
-def fit_us_recession_logit(model_df: pd.DataFrame, lag_months: int = 6):
-    d = model_df.dropna(subset=["USREC"]).copy()
-    d["REC_FWD"] = d["USREC"].rolling(window=lag_months, min_periods=1).max().shift(-lag_months)
-    d = d.dropna()
-    X = add_constant(d[["SPREAD", "UNRATE", "CPI_YoY", "INDPRO_YoY"]], has_constant="add")
-    y = d["REC_FWD"]
-    logit = sm.Logit(y, X).fit(disp=False)
-    d["PROB"] = logit.predict(X)
-    return logit, d.rename(columns={"PROB":"REC_PROB"})
-
-
-def fit_inversion_risk_logit(model_df: pd.DataFrame, lag_months: int = 6):
-    """Generic risk proxy for non-US: probability of an inversion (SPREAD<0) within next L months."""
-    d = model_df.copy()
-    inv = (d["SPREAD"] < 0).astype(int)
-    d["INV_FWD"] = inv.rolling(window=lag_months, min_periods=1).max().shift(-lag_months)
-    d = d.dropna()
-    X = add_constant(d[["SPREAD", "UNRATE", "CPI_YoY", "INDPRO_YoY"]], has_constant="add")
-    y = d["INV_FWD"]
-    logit = sm.Logit(y, X).fit(disp=False)
-    d["INV_PROB"] = logit.predict(X)
-    return logit, d
-
-# =============================
-# --------- VISUALS ------------
-# =============================
-
-def make_spread_chart(hist: pd.Series, fc_mean: pd.Series = None, fc_lower=None, fc_upper=None, title="Term Spread"):
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=hist.index, y=hist.values, mode="lines", name="Historical"))
-    if fc_mean is not None:
-        fig.add_trace(go.Scatter(x=fc_mean.index, y=fc_mean.values, mode="lines", name="Forecast"))
-        if fc_lower is not None and fc_upper is not None:
-            fig.add_trace(go.Scatter(x=fc_mean.index, y=fc_upper.values, mode="lines", name="Upper 95%", line=dict(dash="dot")))
-            fig.add_trace(go.Scatter(x=fc_mean.index, y=fc_lower.values, mode="lines", name="Lower 95%", line=dict(dash="dot"), fill="tonexty"))
-    fig.update_layout(template="plotly_dark", height=420, title=title, legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
-    return fig
-
-
-def make_prob_chart(prob_s: pd.Series, thresh: float, title: str):
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=prob_s.index, y=prob_s.values, mode="lines", name="Probability"))
-    fig.add_hline(y=thresh, line_dash="dash", annotation_text=f"Threshold {thresh:.0%}")
-    fig.update_layout(template="plotly_dark", height=300, title=title)
-    return fig
-
-
-def turning_points(s: pd.Series, thresh: float):
-    cross_up = (s.shift(1) < thresh) & (s >= thresh)
-    cross_dn = (s.shift(1) >= thresh) & (s < thresh)
-    return s[cross_up].index.to_list(), s[cross_dn].index.to_list()
-
-# =============================
-# -------- SIDEBAR -------------
-# =============================
-st.sidebar.header("⚙️ Controls")
-country = st.sidebar.selectbox("Country", list(COUNTRIES.keys()), index=0)
-start = st.sidebar.date_input("Start date", value=date(1990,1,1))
-end = st.sidebar.date_input("End date", value=date.today())
-model_type = st.sidebar.radio("Model Type", ["AR", "VAR"], index=0)
-max_lags = st.sidebar.slider("Max lags (order selection)", 2, 18, 12)
-steps = st.sidebar.slider("Forecast horizon (months)", 3, 24, 12)
-recess_lag = st.sidebar.slider("Forward window (months)", 3, 18, 12)
-prob_thresh = st.sidebar.slider("Turn-point threshold", 0.1, 0.9, 0.5, 0.05)
-
-with st.sidebar.expander("ℹ️ Data notes"):
-    st.write(
-        """
-        **Sources:** FRED CSV endpoints. For non-US, OECD-harmonized monthly series:
-        • LT: IRLTLT01{ISO3}M156N  • ST: IR3TIB01{ISO3}M156N  • UNRATE: LRUNTTTT{ISO3}M156S
-        • CPI YoY: CPALTT01{ISO3}M657N  • IP YoY: PRMNTO01{ISO3}M657N
-        US uses DGS10/DGS2/UNRATE/CPIAUCSL/INDPRO/USREC.
-        """
-    )
-
-# =============================
-# --------- MAIN FLOW ---------
-# =============================
-
-with st.spinner(f"Loading {country} data…"):
-    model_df = load_country_data(country, start.isoformat(), end.isoformat())
-
-col1, col2, col3 = st.columns([2,1,1])
-with col1:
-    st.markdown("### 📊 Data Preview")
-    st.dataframe(model_df.tail(12))
-with col2:
-    st.markdown("### 🔧 Model Fit")
-    if model_type == "AR":
-        ar_model, p_sel, aic = fit_ar(model_df, max_lags=max_lags)
-        st.metric("AR order (AIC)", p_sel)
-        st.caption(f"AIC: {aic:.2f}")
-    else:
-        try:
-            var_model, p_sel = fit_var(model_df, max_lags=min(max_lags, 12))
-            st.metric("VAR order (AIC)", p_sel)
-        except Exception as e:
-            st.error(str(e))
-            var_model = None
-with col3:
-    st.markdown("### 🧭 Horizon")
-    st.metric("Forecast months", steps)
-    st.metric("Forward window", recess_lag)
-
-# Forecast
-hist_spread = model_df["SPREAD"].copy()
-if model_type == "AR":
-    mean, conf = forecast_ar(ar_model, steps=steps)
-    fc_index = pd.date_range(hist_spread.index[-1] + pd.offsets.MonthEnd(0), periods=steps, freq="M")
-    fc_mean = pd.Series(mean.values, index=fc_index, name="Forecast")
-    fc_lower = pd.Series(conf.iloc[:, 0].values, index=fc_index, name="Lower95")
-    fc_upper = pd.Series(conf.iloc[:, 1].values, index=fc_index, name="Upper95")
+can_curve = {}
+can_date = ""
+if src == "Live fetch (Bank of Canada, proxy)":
+    can_curve, can_date = try_fetch_canada_curve()
+    if not can_curve:
+        st.warning("Couldn’t fetch live data right now. Paste spot points below or try again.")
 else:
-    if var_model is not None:
-        mean, lower, upper = forecast_var(var_model, steps=steps)
-        fc_index = pd.date_range(hist_spread.index[-1] + pd.offsets.MonthEnd(0), periods=steps, freq="M")
-        fc_mean = pd.Series(mean["SPREAD"].values, index=fc_index, name="Forecast")
-        fc_lower = pd.Series(lower["SPREAD"].values, index=fc_index, name="Lower95")
-        fc_upper = pd.Series(upper["SPREAD"].values, index=fc_index, name="Upper95")
+    st.info("Enter spot rates (annual %) by maturity. Example: 0.5:4.2, 2:4.5, 5:4.7, 10:4.8, 30:5.0")
+manual = st.text_input("Manual spot map (years:percent, comma-separated)", value="")
+if manual.strip():
+    pairs = manual.split(",")
+    for p in pairs:
+        if ":" in p:
+            t, r = p.split(":")
+            try:
+                can_curve[float(t.strip())] = float(r.strip())/100.0
+            except:
+                pass
+can_curve = dict(sorted(can_curve.items()))
+
+# Show current curve summary
+if can_curve:
+    cols = st.columns(4)
+    label = f"As of {can_date}" if can_date else "User-provided"
+    cols[0].markdown(f"**Status:** {label}")
+    key_tenors = [0.5, 2.0, 5.0, 10.0, 30.0]
+    vals = {t: interp_linear(can_curve, t) for t in key_tenors}
+    cols[1].metric("2Y", f"{vals[2.0]*100:.2f}%")
+    cols[2].metric("10Y", f"{vals[10.0]*100:.2f}%")
+    spread_2s10s_bp = (vals[10.0] - vals[2.0]) * 1e4
+    cols[3].metric("2s10s Spread", f"{spread_2s10s_bp:.0f} bp")
+
+# Plot Canada curve
+if can_curve:
+    fig = plt.figure()
+    xs = sorted(can_curve.keys())
+    ys = [can_curve[x]*100 for x in xs]
+    plt.plot(xs, ys, marker="o", label="Canada Spot (current/proxy)")
+    plt.xlabel("Maturity (years)")
+    plt.ylabel("Spot Rate (%)")
+    plt.title("Current Canada Spot Curve")
+    plt.legend()
+    st.pyplot(fig)
+
+st.divider()
+
+# ======================
+# Tabs
+# ======================
+tab1, tab2 = st.tabs(["Single-Yield Pricing (YTM)", "Curve-Based Pricing (Spots)"])
+
+with tab1:
+    st.subheader("Single-Yield Pricing (Closed-form duration/convexity)")
+    ytm_pct = st.number_input("Yield to Maturity (annual %, bond-equivalent)", -50.0, 200.0, 4.80, step=0.10)
+    ytm = ytm_pct / 100.0
+
+    P, D_mac, D_mod, C = macaulay_mod_duration_convexity(face, coupon, ytm, maturity, freq)
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Price", f"{P:,.2f}")
+    c2.metric("Macaulay Duration", f"{D_mac:.4f} yrs")
+    c3.metric("Modified Duration", f"{D_mod:.4f} yrs")
+    c4.metric("Convexity", f"{C:.4f} yrs²")
+
+    # Cashflow table
+    t = cashflow_times(maturity, freq)
+    per = (t*freq).astype(int)
+    cpn = coupon * face / freq
+    cfs = np.full_like(t, cpn); cfs[-1] += face
+    y = ytm / freq
+    disc = 1.0 / (1.0 + y) ** per
+    pv = cfs * disc
+    df = pd.DataFrame({"Time (yrs)": t, "CF": cfs, "DF": disc, "PV": pv})
+    st.dataframe(df, use_container_width=True)
+
+with tab2:
+    st.subheader("Curve-Based Pricing (Fisher–Weil measures, no bumps)")
+    base_choice = st.selectbox("Base Curve Shape (for comparison)", ["Upward (Normal)", "Flat", "Inverted"], index=0)
+
+    def base_curve(shape: str) -> Dict[float,float]:
+        keys = np.array([0.5,1,2,3,5,7,10,20,30], dtype=float)
+        if shape == "Upward (Normal)":
+            rates = np.array([0.035,0.037,0.040,0.042,0.045,0.047,0.048,0.049,0.050])
+        elif shape == "Flat":
+            rates = np.array([0.040]*len(keys))
+        else:
+            rates = np.array([0.050,0.049,0.047,0.045,0.043,0.041,0.040,0.038,0.037])
+        return dict(zip(keys, rates))
+
+    base = base_curve(base_choice)
+
+    # Plot base vs current Canada
+    fig2 = plt.figure()
+    xs_b = sorted(base.keys()); ys_b = [base[x]*100 for x in xs_b]
+    plt.plot(xs_b, ys_b, label=f"Base: {base_choice}")
+    if can_curve:
+        xs_c = sorted(can_curve.keys()); ys_c = [can_curve[x]*100 for x in xs_c]
+        plt.plot(xs_c, ys_c, marker="o", label="Canada Spot (current/proxy)")
+    plt.xlabel("Maturity (years)"); plt.ylabel("Spot Rate (%)")
+    plt.title("Base vs Current Canada Curve")
+    plt.legend()
+    st.pyplot(fig2)
+
+    if not can_curve:
+        st.warning("Provide a Canada spot curve above to price off spots.")
     else:
-        fc_mean = fc_lower = fc_upper = None
+        P_curve, table = price_from_spot_curve(face, coupon, maturity, freq, can_curve)
+        P_fw, FW_D, FW_C = fisher_weil_measures(face, coupon, maturity, freq, can_curve)
 
-st.plotly_chart(
-    make_spread_chart(hist_spread, fc_mean, fc_lower, fc_upper, title=f"{country}: Term Spread (LT–ST)"),
-    use_container_width=True,
-)
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Price (Curve)", f"{P_curve:,.2f}")
+        c2.metric("Fisher–Weil Duration", f"{FW_D:.4f} yrs")
+        c3.metric("FW Convexity", f"{FW_C:.4f} yrs²")
 
-# Probability models
-if country == "United States":
-    logit_model, prob_df = fit_us_recession_logit(model_df, lag_months=recess_lag)
-    prob_series = prob_df["REC_PROB"]
-    title = "Recession Probability (NBER, forward window)"
-else:
-    logit_model, prob_df = fit_inversion_risk_logit(model_df, lag_months=recess_lag)
-    prob_series = prob_df["INV_PROB"]
-    title = "Yield Curve Inversion Risk (forward window)"
+        # Show implied single-yield from curve price (nice talking point)
+        ytm_impl = ytm_from_price(face, coupon, maturity, freq, P_curve) * 100
+        st.metric("Implied YTM from Curve Price", f"{ytm_impl:.2f}%")
 
-st.markdown("<div class='card'>", unsafe_allow_html=True)
-st.subheader("Turning-Point Probability")
-st.plotly_chart(make_prob_chart(prob_series, prob_thresh, title), use_container_width=True)
+        st.dataframe(table, use_container_width=True)
 
-ups, downs = turning_points(prob_series, prob_thresh)
-colA, colB = st.columns(2)
-with colA:
-    st.markdown("**Crossed ABOVE threshold** (risk rising)")
-    st.write([d.strftime("%Y-%m-%d") for d in ups] or "– None –")
-with colB:
-    st.markdown("**Crossed BELOW threshold** (risk easing)")
-    st.write([d.strftime("%Y-%m-%d") for d in downs] or "– None –")
-
-st.markdown("</div>", unsafe_allow_html=True)
-
-# Downloadables
-
-def to_csv(df: pd.DataFrame):
-    return df.to_csv(index=True).encode("utf-8")
-
-c1, c2, c3 = st.columns(3)
-with c1:
-    st.download_button("⬇️ Download dataset (CSV)", data=to_csv(model_df), file_name=f"{country}_dataset.csv", mime="text/csv")
-with c2:
-    if fc_mean is not None:
-        fc_df = pd.DataFrame({"Forecast": fc_mean, "Lower95": fc_lower, "Upper95": fc_upper})
-        st.download_button("⬇️ Download forecast (CSV)", data=to_csv(fc_df), file_name=f"{country}_forecast.csv", mime="text/csv")
-with c3:
-    st.download_button("⬇️ Download probabilities (CSV)", data=to_csv(prob_series.to_frame("PROB")), file_name=f"{country}_prob.csv", mime="text/csv")
-
-st.caption("Data via FRED/OECD; for non-US countries, probability targets inverted-curve risk rather than official recession dates.")
+st.caption("Notes: YTM tab uses closed-form Macaulay/Modified duration and discrete convexity. Curve tab uses spot discounts with Fisher–Weil measures. Canada curve uses BoC data when available; otherwise enter manually.")
 
